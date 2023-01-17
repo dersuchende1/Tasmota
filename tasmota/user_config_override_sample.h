@@ -87,7 +87,18 @@ Examples :
 // !!! Remember that your changes GOES AT THE BOTTOM OF THIS FILE right before the last #endif !!!
 */
 
-
+#ifndef USE_SML_M
+#define USE_SML_M
+#endif
+#ifndef USE_SML_SCRIPT_CMD
+#define USE_SML_SCRIPT_CMD
+#endif
+#ifndef USE_SCRIPT_WEB_DISPLAY
+#define USE_SCRIPT_WEB_DISPLAY
+#endif
+#ifndef USE_SCRIPT_JSON_EXPORT
+#define USE_SCRIPT_JSON_EXPORT
+#endif
 
 
 
