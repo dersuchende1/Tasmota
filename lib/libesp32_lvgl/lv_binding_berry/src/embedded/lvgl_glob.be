@@ -1,20 +1,22 @@
 #- embedded class for LVGL globals -#
 
+#@ solidify:LVGL_glob,weak
 #- This class stores all globals used by LVGL and cannot be stored in the solidified module -#
 #- this limits the globals to a single value '_lvgl' -#
 class LVGL_glob
   # all variables are lazily initialized to reduce the memory pressure. Until they are used, they consume zero memory
   var cb_obj                # map between a native C pointer (as int) and the corresponding lv.lv_* berry object, also helps marking the objects as non-gc-able
-  var cb_event_closure      # mapping for event closures per LVGL native pointer (int)
-  var event_cb              # native callback for lv.lv_event
+  var cb_event_closure      # mapping for event closures per LVGL native pointer (int). For each int key, contains either a closure or an array with multiple closures
+  var event_cb              # array of native callback for lv.lv_event (when multiple are needed)
   var timer_cb              # native callback for lv.lv_timer
   var event                 # keep aroud the current lv_event to avoid repeated allocation
+  var general_event_cb      # new simplified way to register event_cb to any widget
 
   #- below are native callbacks mapped to a closure to a method of this instance -#
   var null_cb               # cb called if type is not supported
   var widget_ctor_cb
   var widget_dtor_cb
-  var widget_event_cb
+  var widget_event_cb       # callback object that calls `widget_event_impl(object, event)`
   
   var widget_struct_default
   var widget_struct_by_class
@@ -26,14 +28,36 @@ class LVGL_glob
   def init()
     import cb
     cb.add_handler(/ f, obj, name -> self.make_cb(f, obj, name))
+    # general cb for events
+    # self.general_event_cb = cb.gen_cb(self._dispatch_event_cb)
     # load extra modules
     import lv_extra
   end
 
   #- register an lv.lv_* object in the mapping -#
+  #
+  # returns `true` if it was already present, false instead
   def register_obj(obj)
     if self.cb_obj == nil    self.cb_obj = {} end
-    self.cb_obj[obj._p] = obj
+    if self.cb_obj.contains(obj._p)
+      return true
+    else
+      self.cb_obj[obj._p] = obj
+      return false
+    end
+  end
+
+  # get event callback by rank number, expand the list if needed
+  def get_event_cb(n)
+    if self.event_cb == nil   self.event_cb = [] end          # lazy initial initialization
+
+    var cb_arr = self.event_cb
+    for i: size(cb_arr) .. n
+      var next_cb = cb.gen_cb(/ event_ptr -> self.lvgl_event_dispatch(i, event_ptr))
+      cb_arr.push(next_cb)
+    end
+
+    return cb_arr[n]
   end
 
   def get_object_from_ptr(ptr)
@@ -42,19 +66,23 @@ class LVGL_glob
     end
   end
 
-  def lvgl_event_dispatch(event_ptr_i)
+  def lvgl_event_dispatch(rank, event_ptr_i)
     import introspect
     var event_ptr = introspect.toptr(event_ptr_i)
 
-    if self.event   self.event._change_buffer(event_ptr)
+    # use always the same instance of lv.lv_event by changing pointer, create a new the first time
+    if self.event   self.event._p = event_ptr
     else            self.event = lv.lv_event(event_ptr)
     end
 
-    var target = self.event.target
-    var f = self.cb_event_closure[target]
-    var obj = self.get_object_from_ptr(target)
-    #print('>> lvgl_event_dispatch', f, obj, event)
-    f(obj, self.event)
+    var target = self.event.get_target()          # LVGL native object as target of the event (comptr)
+    var obj = self.get_object_from_ptr(target)    # get the corresponding Berry LVGL object previously recorded as its container
+    var f = self.cb_event_closure[target]         # get the closure or closure list known for this object
+    if type(f) == 'function'                      # if only one callback, just use it
+      f(obj, self.event)
+    elif rank < size(f)                           # if more than one, then it's a list - use the closure for `rank`
+      f[rank](obj, self.event)
+    end
   end
 
   def lvgl_timer_dispatch(timer_int)
@@ -63,33 +91,76 @@ class LVGL_glob
     var timer_ptr = introspect.toptr(timer_int)
     var f = self.cb_event_closure[timer_ptr]
     #print('>> lvgl_timer_dispatch', f, obj, event)
-    f(timer_ptr)
+    if type(f) == 'function'
+      f(timer_ptr)
+    else
+      # array
+      var i = 0
+      while i < size(f)
+        f[i](timer_ptr)
+        i += 1
+      end
+    end
   end
 
+  # add a closure `f` to the object `o`
+  #
+  # returns: rank of the cb for this object, starting at `0`
+  def add_cb_event_closure(o, f)
+    if self.cb_event_closure == nil   self.cb_event_closure = {} end    # lazy instanciation
+    if self.cb_event_closure.contains(o)
+      # contains already a value, create an array if needed
+      var cur = self.cb_event_closure[o]
+      if type(cur) == 'function'
+        self.cb_event_closure[o] = [cur, f]
+        return 1
+      else
+        # should be already an array
+        self.cb_event_closure[o].push(f)
+        return size(self.cb_event_closure[o]) - 1
+      end
+    else
+      self.cb_event_closure[o] = f
+      return 0
+    end
+  end
+
+  # remove all references to an object when `lv.EVENT_DELETE` is triggered
+  def remove_cb(obj)
+    import introspect
+    var obj_ptr = obj._p
+    # print(">>> DELETE",obj,obj_ptr)
+    self.deregister_obj(obj_ptr)
+    # print(self.cb_event_closure)
+  end
+
+  #
+  # Warning: `make_cb` is called by `cb.gen_cb()` as a cb handler.
+  # Calling back `cb.gen_cb()` should be done with caution to avoid infinite loops.
+  #
   def make_cb(f, obj, name)
+    # fast exit if not for us
+    if name == nil return nil end
+
     import cb
     # print('>> make_cb', f, name, obj)
     # record the object, whatever the callback
     
     if name  == "lv_event_cb"
-      if self.cb_event_closure == nil   self.cb_event_closure = {} end    # lazy instanciation
-      if self.event_cb == nil			      self.event_cb = cb.gen_cb(/ event_ptr -> self.lvgl_event_dispatch(event_ptr)) end  # encapsulate 'self' in closure
-    
-      self.register_obj(obj)                # keep a record of the object to prevent from being gc'ed
-      if self.cb_event_closure.contains(obj._p)
-        tasmota.log("LVG: object:" + str(obj) + "has already an event callback", 2)
+      var first_cb = !self.register_obj(obj)                # keep a record of the object to prevent from being gc'ed
+      if first_cb                                           # first time we register a CB for this object, register also a DELETE event
+        obj.add_event_cb(/ o -> self.remove_cb(o), lv.EVENT_DELETE, 0)
       end
-      self.cb_event_closure[obj._p] = f     # keep a mapping of the closure to call, indexed by internal lvgl native pointer
-      return self.event_cb
+      var rank = self.add_cb_event_closure(obj._p, f)
+      # if self.cb_event_closure.contains(obj._p)
+      #   tasmota.log("LVG: object:" + str(obj) + "has already an event callback", 2)
+      # end
+      # self.cb_event_closure[obj._p] = f     # keep a mapping of the closure to call, indexed by internal lvgl native pointer
+      return self.get_event_cb(rank)
     elif name == "lv_timer_cb"
-      if self.cb_event_closure == nil   self.cb_event_closure = {} end    # lazy instanciation
       if self.timer_cb == nil			      self.timer_cb = cb.gen_cb(/ timer_ptr -> self.lvgl_timer_dispatch(timer_ptr)) end  # encapsulate 'self' in closure
 
-      # no need to register the object since it's only a pointer to a timer
-      if self.cb_event_closure.contains(obj._p)
-        tasmota.log("LVG: object:" + str(obj) + "has already an event callback", 2)
-      end
-      self.cb_event_closure[obj._p] = f     # keep a mapping of the closure to call, indexed by internal lvgl native pointer
+      self.add_cb_event_closure(obj._p, f)
       return self.timer_cb
 
     # elif name == "<other_cb>"
@@ -120,20 +191,27 @@ class LVGL_glob
       obj.widget_destructor(cl)
     end
   end
+  # called by event handler
+  # input:
+  #    cl_ptr: (int) pointer to class structure
+  #    e_ptr: (int) pointer to event object
   def widget_event_impl(cl_ptr, e_ptr)
     import introspect
+    # tasmota.log(f'>>>: widget_event_impl cl_ptr {cl_ptr=} e_ptr {e_ptr=}')
     var cl = lv.lv_obj_class(cl_ptr)
-    var event = lv.lv_event(e_ptr)
-    var obj_ptr = event.target
-    var obj = self.get_object_from_ptr(obj_ptr)
+    var event = lv.lv_event(introspect.toptr(e_ptr))
+    # tasmota.log(f'>>>: widget_event_impl cl {cl=} event {event=}')
+    # var obj_ptr = event.target
+    var obj_ptr = event.get_target_obj()
+    var obj = self.get_object_from_ptr(obj_ptr._p)
+    # tasmota.log(f">>>: widget_event_impl {obj_ptr=} {obj=}")
     if type(obj) == 'instance'
-      if event.code == lv.EVENT_DELETE && introspect.get(obj, 'before_del')
+      if event.get_code() == lv.EVENT_DELETE && introspect.get(obj, 'before_del')
         obj.before_del(cl, event)
       elif introspect.get(obj, 'widget_event')
         obj.widget_event(cl, event)
       end
     end
-    # print("widget_event_impl", cl, obj_ptr, obj, event)
   end
 
 
@@ -174,12 +252,13 @@ class LVGL_glob
       self.widget_cb()    # set up all structures
       obj_class_struct = self.widget_struct_default.copy()    # get a copy of the structure with pre-defined callbacks
       obj_class_struct.base_class = super(obj)._class
-      if introspect.get(obj, 'widget_width_def')     obj_class_struct.width_def = obj.widget_width_def          end
-      if introspect.get(obj, 'widget_height_def')    obj_class_struct.height_def = obj.widget_height_def        end
-      if introspect.get(obj, 'widget_editable')      obj_class_struct.editable = obj.widget_editable            end
-      if introspect.get(obj, 'widget_group_def')     obj_class_struct.group_def = obj.widget_group_def          end
-      if introspect.get(obj, 'widget_instance_size') obj_class_struct.instance_size = obj.widget_instance_size  end
-
+      if introspect.contains(obj, 'widget_width_def')     obj_class_struct.width_def = obj.widget_width_def          end
+      if introspect.contains(obj, 'widget_height_def')    obj_class_struct.height_def = obj.widget_height_def        end
+      if introspect.contains(obj, 'widget_editable')      obj_class_struct.editable = obj.widget_editable            end
+      if introspect.contains(obj, 'widget_group_def')     obj_class_struct.group_def = obj.widget_group_def          end
+      if introspect.contains(obj, 'widget_instance_size') obj_class_struct.instance_size = obj.widget_instance_size  end
+      
+      # tasmota.log(f'>>>: {obj_class_struct=} map {obj_class_struct.tomap()}')
       #- keep a copy of the structure to avoid GC and reuse if needed -#
       self.widget_struct_by_class[obj_classname] = obj_class_struct
     end
@@ -189,101 +268,30 @@ class LVGL_glob
     self.register_obj(obj)
     obj.class_init_obj()
   end
+
+  # # new simplified way to implement a custom widget by just adding an event cb
+  # #
+  # # input:
+  # #   lvovj: (instance of lv_obj of sub-class) the instance that will receive events
+  # #   event_filter: lvgl event_filter
+  # #
+  # # The method `event_cb(lv_event)` will be called 
+  # #
+  # # TODO: make sure that the instance to the berry object is still valid and was not GCed
+  # def add_event_cb(lvobj, event_filter)
+  #   import introspect
+  #   var cb = self.general_event_cb
+  #   #lvovj.add_event_cb()
+  # end
+
+  # # the function called by LVGL and dispatching to the right object
+  # #
+  # # TODO
+  # static def _dispatch_event_cb(event_int)
+  # end
+
 end
 
-_lvgl = LVGL_glob()
-
-# class lv_custom_widget : lv.lv_obj
-#   # static widget_width_def
-#   # static widget_height_def
-#   # static widget_editable
-#   # static widget_group_def
-#   # static widget_instance_size
-#   #
-#   var percentage              # value to display, range 0..100
-#   var p1, p2, area, line_dsc  # instances of objects kept to avoid re-instanciating at each call
-
-#   def init(parent)
-#     _lvgl.create_custom_widget(self, parent)
-#     # own values
-#     self.percentage = 100
-#     # pre-allocate buffers
-#     self.p1 = lv.lv_point()
-#     self.p2 = lv.lv_point()
-#     self.area = lv.lv_area()
-#     self.line_dsc = lv.lv_draw_line_dsc()
-#   end
-
-#   # def widget_constructor(cl)
-#   #   print("widget_constructor", cl)
-#   # end
-
-#   # def widget_destructor(cl)
-#   #   print("widget_destructor", cl)
-#   # end
-
-#   def widget_event(cl, event)
-#     var res = lv.obj_event_base(cl, event)
-#     if res != lv.RES_OK  return  end
-
-#     def atleast1(x) if x >= 1 return x else return 1 end end
-#     # the model is that we have 4 bars and inter-bar (1/4 of width)
-#     var height = self.get_height()
-#     var width = self.get_width()
-
-#     var inter_bar = atleast1(width / 15)
-#     var bar = atleast1((width - inter_bar * 3) / 4)
-#     var bar_offset = bar / 2
-
-#     var code = event.code
-#     if code == lv.EVENT_DRAW_MAIN
-#       var clip_area = lv.lv_area(event.param)
-#       print("widget_event DRAW", clip_area.tomap())
-#       # lv.event_send(self, lv.EVENT_DRAW_MAIN, clip_area)
-
-#       # get coordinates of object
-#       self.get_coords(self.area)
-#       var x_ofs = self.area.x1
-#       var y_ofs = self.area.y1
-
-#       lv.draw_line_dsc_init(self.line_dsc)          # initialize lv.lv_draw_line_dsc structure
-#       self.init_draw_line_dsc(lv.PART_MAIN, self.line_dsc)
-
-#       self.line_dsc.round_start = 1
-#       self.line_dsc.round_end = 1
-#       self.line_dsc.width = bar
-      
-#       var on_color = self.get_style_line_color(lv.PART_MAIN | lv.STATE_DEFAULT)
-#       var off_color = self.get_style_bg_color(lv.PART_MAIN | lv.STATE_DEFAULT)
-
-#       lv.event_send(self, lv.EVENT_DRAW_PART_BEGIN, self.line_dsc)
-#       for i:0..3    # 4 bars
-#         self.line_dsc.color = self.percentage >= (i+1)*20 ? on_color : off_color
-#         self.p1.y = y_ofs + height - 1 - bar_offset
-#         self.p1.x = x_ofs + i * (bar + inter_bar) + bar_offset
-#         self.p2.y = y_ofs + ((3 - i) * (height - bar)) / 4 + bar_offset
-#         self.p2.x = self.p1.x
-#         lv.draw_line(self.p1, self.p2, clip_area, self.line_dsc)
-#       end
-#       lv.event_send(self, lv.EVENT_DRAW_PART_END, self.line_dsc)
-
-#     end
-#   end
-
-#   def set_percentage(v)
-#     var old_bars = self.percentage / 5
-#     if v > 100 v = 100 end
-#     if v < 0   v = 0 end
-#     self.percentage = v
-#     if old_bars != v / 5
-#       self.invalidate()    # be frugal and avoid updating the widget if it's not needed
-#     end
-#   end
-
-#   def get_percentage()
-#     return self.percentage
-#   end
-# end
 
 # ########## ########## ########## ########## ########## ########## ########## ##########
 

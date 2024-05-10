@@ -13,7 +13,8 @@
  -   addr: I2C address of device, will probe all I2C buses for it
  -   i2c_index: (optional) check is the device is not disabled
  -------------------------------------------------------------#
-
+ 
+#@ solidify:I2C_Driver
 class I2C_Driver
   var wire          #- wire object to reach the device, if nil then the module is not initialized -#
   var addr          #- I2C address of the device -#
@@ -82,6 +83,16 @@ class I2C_Driver
   def read13(reg)
     var buf = self.wire.read_bytes(self.addr, reg, 2)
     return (buf[0] << 5) + buf[1]
+  end
+  # read 14 bits
+  def read14(reg)
+    var buf = self.wire.read_bytes(self.addr, reg, 2)
+    return (buf[0] << 6) + buf[1]
+  end
+  # read 16 bits
+  def read16(reg)
+    var buf = self.wire.read_bytes(self.addr, reg, 2)
+    return (buf[0] << 8) + buf[1]
   end
   # read 24 bits
   def read24(reg)

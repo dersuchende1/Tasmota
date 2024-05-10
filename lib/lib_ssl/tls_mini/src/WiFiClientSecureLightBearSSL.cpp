@@ -34,6 +34,7 @@
 
 #include "WiFiClientSecureLightBearSSL.h"	// needs to be before "ESP8266WiFi.h" to avoid conflict with Arduino headers
 #include "ESP8266WiFi.h"
+#include "WiFiHelper.h"
 #include "WiFiClient.h"
 #include "StackThunk_light.h"
 #include "lwip/opt.h"
@@ -299,7 +300,7 @@ int WiFiClientSecure_light::connect(IPAddress ip, uint16_t port, int32_t timeout
     setLastError(ERR_TCP_CONNECT);
     return 0;
   }
-  return _connectSSL(nullptr);
+  return _connectSSL(_domain.isEmpty() ? nullptr : _domain.c_str());
 }
 #else // ESP32
 int WiFiClientSecure_light::connect(IPAddress ip, uint16_t port) {
@@ -309,7 +310,7 @@ int WiFiClientSecure_light::connect(IPAddress ip, uint16_t port) {
     setLastError(ERR_TCP_CONNECT);
     return 0;
   }
-  return _connectSSL(nullptr);
+  return _connectSSL(_domain.isEmpty() ? nullptr : _domain.c_str());
 }
 #endif
 
@@ -318,7 +319,7 @@ int WiFiClientSecure_light::connect(const char* name, uint16_t port, int32_t tim
   DEBUG_BSSL("connect(%s,%d)\n", name, port);
   IPAddress remote_addr;
   clearLastError();
-  if (!WiFi.hostByName(name, remote_addr)) {
+  if (!WiFiHelper::hostByName(name, remote_addr)) {
     DEBUG_BSSL("connect: Name loopup failure\n");
     setLastError(ERR_CANT_RESOLVE_IP);
     return 0;
@@ -337,7 +338,7 @@ int WiFiClientSecure_light::connect(const char* name, uint16_t port) {
   DEBUG_BSSL("connect(%s,%d)\n", name, port);
   IPAddress remote_addr;
   clearLastError();
-  if (!WiFi.hostByName(name, remote_addr)) {
+  if (!WiFiHelper::hostByName(name, remote_addr)) {
     DEBUG_BSSL("connect: Name loopup failure\n");
     setLastError(ERR_CANT_RESOLVE_IP);
     return 0;
@@ -557,10 +558,16 @@ int WiFiClientSecure_light::_run_until(unsigned target, bool blocking) {
     DEBUG_BSSL("_run_until: Not connected\n");
     return -1;
   }
+  uint32_t t = millis();
   for (int no_work = 0; blocking || no_work < 2;) {
     if (blocking) {
       // Only for blocking operations can we afford to yield()
       optimistic_yield(100);
+    }
+    
+    if (((int32_t)(millis() - (t + this->_loopTimeout)) >= 0)){
+      DEBUG_BSSL("_run_until: Timeout\n");
+      return -1;
     }
 
     int state;
